@@ -57,21 +57,13 @@ constexpr uint64_t kCacheSize = 1024 * 1024;  // 1MB
 // Growth granularity for file-backed slot images (kernel_X etc.).
 constexpr uint64_t kSlotGrowAlignBytes = 16ULL * 1024 * 1024;  // 16 MiB
 
-// If |target_path| is a loop device backed by a regular file and that file
-// is smaller than |required_size|, grow the file (rounded up to a multiple
-// of kSlotGrowAlignBytes, so e.g. a 22 MiB kernel into a 20 MiB slot grows
-// it to 32 MiB) and refresh the loop size. Grow-only, guarded by free
-// space. Real (non-loop) partitions are left alone. Returns true when
-// nothing had to be done or the growth succeeded; false aborts the install
-// cleanly before anything is written.
 // If |target_path| is a loop device backed by a regular file and the loop
-// is smaller than |required_size|, make it fit: grow (or replace) the
-// backing file, rounded up to a multiple of kSlotGrowAlignBytes (so e.g. a
-// 22 MiB kernel into a 20 MiB slot grows it to 32 MiB), copy the old
-// content over when switching files, and repoint the same loop number at
-// it. Grow-only, guarded by free space. Real (non-loop) partitions are left
-// alone. Returns true when nothing had to be done or the slot was fixed;
-// false aborts the install cleanly before anything is written.
+// is smaller than |required_size|, make it fit: grow /mnt/cdrom/<slot> to a
+// multiple of kSlotGrowAlignBytes and repoint the same loop number at it
+// (detach + attach, exactly like the manual flow). Grow-only, guarded by
+// free space. Real (non-loop) partitions are left alone. Returns true when
+// nothing had to be done or the slot was fixed; false aborts the install
+// cleanly before anything is written.
 bool EnsureFileBackedSlotCapacity(const std::string& target_path,
                                   uint64_t required_size) {
   if (required_size == 0) {
@@ -121,56 +113,20 @@ bool EnsureFileBackedSlotCapacity(const std::string& target_path,
                << " is too small and not a loop device, cannot grow it";
     return false;
   }
-  // Candidate backing files: the install-media copy first (it is what the
-  // bootloader will find on the next boot), then whatever sysfs reports.
+  // Slot files live next to the install media, exactly like the manual
+  // flow expects: /mnt/cdrom/<slot>. The program already knows the target
+  // path, no sysfs archaeology needed.
   auto slash = target_path.find_last_of('/');
   std::string base = (slash == std::string::npos)
                          ? target_path
                          : target_path.substr(slash + 1);
-  std::string cdrom_path = std::string("/mnt/cdrom/") + base;
-  auto lslash = loop_node.find_last_of('/');
-  std::string loopname = (lslash == std::string::npos)
-                             ? loop_node
-                             : loop_node.substr(lslash + 1);
-  std::string sysfs_path =
-      std::string("/sys/block/") + loopname + "/loop/backing_file";
-  std::string backing_now;
-  {
-    int bfd = ::open(sysfs_path.c_str(), O_RDONLY | O_CLOEXEC);
-    if (bfd >= 0) {
-      char backing[PATH_MAX];
-      ssize_t len = read(bfd, backing, sizeof(backing) - 1);
-      ::close(bfd);
-      if (len > 0) {
-        backing[len] = '\0';
-        backing_now = backing;
-        while (!backing_now.empty() &&
-               (backing_now.back() == '\n' || backing_now.back() == '\r' ||
-                backing_now.back() == ' ')) {
-          backing_now.pop_back();
-        }
-      }
-    }
-  }
+  std::string chosen = std::string("/mnt/cdrom/") + base;
   struct stat cdrom_st {};
-  bool have_cdrom = (::stat(cdrom_path.c_str(), &cdrom_st) == 0);
-  struct stat back_st {};
-  bool have_backing =
-      !backing_now.empty() && (::stat(backing_now.c_str(), &back_st) == 0);
-  std::string chosen;
-  uint64_t chosen_size = 0;
-  if (have_cdrom) {
-    chosen = cdrom_path;
-    chosen_size = static_cast<uint64_t>(cdrom_st.st_size);
-  } else if (have_backing) {
-    chosen = backing_now;
-    chosen_size = static_cast<uint64_t>(back_st.st_size);
-  } else {
-    LOG(ERROR) << "No slot file to grow for " << target_path
-               << " (tried " << cdrom_path << " and sysfs backing"
-               << (backing_now.empty() ? " (unreadable)" : "") << ")";
+  if (::stat(chosen.c_str(), &cdrom_st) != 0) {
+    LOG(ERROR) << "No slot file " << chosen << " for " << target_path;
     return false;
   }
+  uint64_t chosen_size = static_cast<uint64_t>(cdrom_st.st_size);
   uint64_t new_size = ((required_size + kSlotGrowAlignBytes - 1) /
                        kSlotGrowAlignBytes) *
                       kSlotGrowAlignBytes;
@@ -189,10 +145,6 @@ bool EnsureFileBackedSlotCapacity(const std::string& target_path,
       (new_size > chosen_size) ? (new_size - chosen_size) : 0;
   uint64_t avail =
       static_cast<uint64_t>(stv.f_bavail) * static_cast<uint64_t>(stv.f_frsize);
-  // Replacing the backing also briefly needs the old content staged.
-  if (backing_now != chosen) {
-    need += loop_bytes;
-  }
   if (avail < need) {
     LOG(ERROR) << "Not enough free space for slot " << target_path << " (need "
                << need << ", have " << avail << ")";
@@ -217,65 +169,9 @@ bool EnsureFileBackedSlotCapacity(const std::string& target_path,
     ok = true;
   }
   int loop_fd = -1;
-  if (ok && backing_now != chosen) {
-    // Switch the loop to the chosen file, preserving old content for
-    // delta payloads that reference it.
-    LOG(INFO) << "Repointing " << loop_node << " from "
-              << (backing_now.empty() ? "<none>" : backing_now) << " to "
-              << chosen;
-    int src_fd = ::open(target_path.c_str(), O_RDONLY | O_CLOEXEC);
-    if (src_fd >= 0) {
-      std::vector<char> buf(1024 * 1024);
-      uint64_t copied = 0;
-      while (ok && copied < loop_bytes) {
-        uint64_t want = loop_bytes - copied;
-        if (want > buf.size()) {
-          want = buf.size();
-        }
-        ssize_t got = 0;
-        size_t off = 0;
-        while (off < want) {
-          got = read(src_fd, buf.data() + off, want - off);
-          if (got == 0) {
-            break;
-          }
-          if (got < 0) {
-            if (errno == EINTR) {
-              continue;
-            }
-            break;
-          }
-          off += got;
-        }
-        if (off != want) {
-          PLOG(ERROR) << "Unable to read old slot content";
-          ok = false;
-          break;
-        }
-        off = 0;
-        while (off < want) {
-          got = write(file_fd, buf.data() + off, want - off);
-          if (got < 0) {
-            if (errno == EINTR) {
-              continue;
-            }
-            break;
-          }
-          off += got;
-        }
-        if (off != want) {
-          PLOG(ERROR) << "Unable to stage old slot content";
-          ok = false;
-          break;
-        }
-        copied += want;
-      }
-      ::close(src_fd);
-    } else {
-      PLOG(ERROR) << "Unable to open " << target_path << " for content copy";
-      ok = false;
-    }
-  }
+  // Manual flow parity: detach the loop and reattach it to the grown file.
+  // No content copy: the payload overwrites the slot fully right after.
+  LOG(INFO) << "Repointing " << loop_node << " to " << chosen;
   if (ok) {
     ::fsync(file_fd);
     loop_fd = ::open(loop_node.c_str(), O_RDWR | O_CLOEXEC);
@@ -284,21 +180,16 @@ bool EnsureFileBackedSlotCapacity(const std::string& target_path,
       ok = false;
     }
   }
-  if (ok && backing_now != chosen) {
+  if (ok) {
     if (::ioctl(loop_fd, LOOP_CLR_FD, 0) != 0) {
       PLOG(ERROR) << "LOOP_CLR_FD failed on " << loop_node;
       ok = false;
     }
   }
   if (ok) {
-    if (backing_now != chosen) {
-      if (::ioctl(loop_fd, LOOP_SET_FD, file_fd) != 0) {
-        PLOG(ERROR) << "LOOP_SET_FD failed on " << loop_node
-                    << ", slot left detached!";
-        ok = false;
-      }
-    } else if (::ioctl(loop_fd, LOOP_SET_CAPACITY, 0) != 0) {
-      PLOG(ERROR) << "LOOP_SET_CAPACITY failed on " << loop_node;
+    if (::ioctl(loop_fd, LOOP_SET_FD, file_fd) != 0) {
+      PLOG(ERROR) << "LOOP_SET_FD failed on " << loop_node
+                  << ", slot left detached!";
       ok = false;
     }
   }
