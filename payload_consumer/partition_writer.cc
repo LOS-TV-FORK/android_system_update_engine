@@ -16,14 +16,22 @@
 #include <update_engine/payload_consumer/partition_writer.h>
 
 #include <fcntl.h>
+#include <limits.h>
 #include <linux/fs.h>
+#include <linux/loop.h>
+#include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
+#include <sys/statvfs.h>
+#include <unistd.h>
 
 #include <inttypes.h>
 
 #include <algorithm>
+#include <cerrno>
 #include <initializer_list>
 #include <memory>
+#include <stdlib.h>
 #include <string>
 #include <utility>
 #include <vector>
@@ -45,6 +53,277 @@ namespace chromeos_update_engine {
 
 namespace {
 constexpr uint64_t kCacheSize = 1024 * 1024;  // 1MB
+
+// Growth granularity for file-backed slot images (kernel_X etc.).
+constexpr uint64_t kSlotGrowAlignBytes = 16ULL * 1024 * 1024;  // 16 MiB
+
+// If |target_path| is a loop device backed by a regular file and that file
+// is smaller than |required_size|, grow the file (rounded up to a multiple
+// of kSlotGrowAlignBytes, so e.g. a 22 MiB kernel into a 20 MiB slot grows
+// it to 32 MiB) and refresh the loop size. Grow-only, guarded by free
+// space. Real (non-loop) partitions are left alone. Returns true when
+// nothing had to be done or the growth succeeded; false aborts the install
+// cleanly before anything is written.
+// If |target_path| is a loop device backed by a regular file and the loop
+// is smaller than |required_size|, make it fit: grow (or replace) the
+// backing file, rounded up to a multiple of kSlotGrowAlignBytes (so e.g. a
+// 22 MiB kernel into a 20 MiB slot grows it to 32 MiB), copy the old
+// content over when switching files, and repoint the same loop number at
+// it. Grow-only, guarded by free space. Real (non-loop) partitions are left
+// alone. Returns true when nothing had to be done or the slot was fixed;
+// false aborts the install cleanly before anything is written.
+bool EnsureFileBackedSlotCapacity(const std::string& target_path,
+                                  uint64_t required_size) {
+  if (required_size == 0) {
+    return true;
+  }
+  // Current loop size first: healthy slots are untouched.
+  int tfd = ::open(target_path.c_str(), O_RDONLY | O_CLOEXEC);
+  if (tfd < 0) {
+    return true;
+  }
+  uint64_t loop_bytes = 0;
+  int blk_ret = ::ioctl(tfd, BLKGETSIZE64, &loop_bytes);
+  ::close(tfd);
+  if (blk_ret != 0) {
+    return true;
+  }
+  if (loop_bytes >= required_size) {
+    return true;
+  }
+  LOG(INFO) << "Slot " << target_path << " is " << loop_bytes
+            << " bytes, payload needs " << required_size
+            << " bytes, fixing it up";
+  // Resolve the loop device behind |target_path| by device number: the
+  // by-name nodes here are real device nodes, not symlinks to /dev/loopN.
+  struct stat st {};
+  if (::stat(target_path.c_str(), &st) != 0 || !S_ISBLK(st.st_mode)) {
+    LOG(ERROR) << "Slot " << target_path << " is not a block device";
+    return false;
+  }
+  std::string loop_node;
+  for (int i = 0; i < 64; ++i) {
+    for (const auto& dir : {"/dev/block/loop", "/dev/loop"}) {
+      std::string cand = dir + std::to_string(i);
+      struct stat cst {};
+      if (::stat(cand.c_str(), &cst) == 0 && S_ISBLK(cst.st_mode) &&
+          cst.st_rdev == st.st_rdev) {
+        loop_node = cand;
+        break;
+      }
+    }
+    if (!loop_node.empty()) {
+      break;
+    }
+  }
+  if (loop_node.empty()) {
+    LOG(ERROR) << "Slot " << target_path
+               << " is too small and not a loop device, cannot grow it";
+    return false;
+  }
+  // Candidate backing files: the install-media copy first (it is what the
+  // bootloader will find on the next boot), then whatever sysfs reports.
+  auto slash = target_path.find_last_of('/');
+  std::string base = (slash == std::string::npos)
+                         ? target_path
+                         : target_path.substr(slash + 1);
+  std::string cdrom_path = std::string("/mnt/cdrom/") + base;
+  auto lslash = loop_node.find_last_of('/');
+  std::string loopname = (lslash == std::string::npos)
+                             ? loop_node
+                             : loop_node.substr(lslash + 1);
+  std::string sysfs_path =
+      std::string("/sys/block/") + loopname + "/loop/backing_file";
+  std::string backing_now;
+  {
+    int bfd = ::open(sysfs_path.c_str(), O_RDONLY | O_CLOEXEC);
+    if (bfd >= 0) {
+      char backing[PATH_MAX];
+      ssize_t len = read(bfd, backing, sizeof(backing) - 1);
+      ::close(bfd);
+      if (len > 0) {
+        backing[len] = '\0';
+        backing_now = backing;
+        while (!backing_now.empty() &&
+               (backing_now.back() == '\n' || backing_now.back() == '\r' ||
+                backing_now.back() == ' ')) {
+          backing_now.pop_back();
+        }
+      }
+    }
+  }
+  struct stat cdrom_st {};
+  bool have_cdrom = (::stat(cdrom_path.c_str(), &cdrom_st) == 0);
+  struct stat back_st {};
+  bool have_backing =
+      !backing_now.empty() && (::stat(backing_now.c_str(), &back_st) == 0);
+  std::string chosen;
+  uint64_t chosen_size = 0;
+  if (have_cdrom) {
+    chosen = cdrom_path;
+    chosen_size = static_cast<uint64_t>(cdrom_st.st_size);
+  } else if (have_backing) {
+    chosen = backing_now;
+    chosen_size = static_cast<uint64_t>(back_st.st_size);
+  } else {
+    LOG(ERROR) << "No slot file to grow for " << target_path
+               << " (tried " << cdrom_path << " and sysfs backing"
+               << (backing_now.empty() ? " (unreadable)" : "") << ")";
+    return false;
+  }
+  uint64_t new_size = ((required_size + kSlotGrowAlignBytes - 1) /
+                       kSlotGrowAlignBytes) *
+                      kSlotGrowAlignBytes;
+  if (new_size < chosen_size) {
+    new_size = chosen_size;
+  }
+  auto dirslash = chosen.find_last_of('/');
+  std::string backing_dir =
+      (dirslash == std::string::npos) ? "." : chosen.substr(0, dirslash);
+  struct statvfs stv {};
+  if (::statvfs(backing_dir.c_str(), &stv) != 0) {
+    PLOG(ERROR) << "Unable to statvfs " << backing_dir;
+    return false;
+  }
+  uint64_t need =
+      (new_size > chosen_size) ? (new_size - chosen_size) : 0;
+  uint64_t avail =
+      static_cast<uint64_t>(stv.f_bavail) * static_cast<uint64_t>(stv.f_frsize);
+  // Replacing the backing also briefly needs the old content staged.
+  if (backing_now != chosen) {
+    need += loop_bytes;
+  }
+  if (avail < need) {
+    LOG(ERROR) << "Not enough free space for slot " << target_path << " (need "
+               << need << ", have " << avail << ")";
+    return false;
+  }
+  int file_fd =
+      ::open(chosen.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0644);
+  if (file_fd < 0) {
+    PLOG(ERROR) << "Unable to open slot file " << chosen;
+    return false;
+  }
+  bool ok = false;
+  if (new_size > chosen_size) {
+    LOG(INFO) << "Growing slot file " << chosen << " from " << chosen_size
+              << " to " << new_size << " bytes for " << required_size
+              << " bytes of payload";
+    ok = (::ftruncate(file_fd, new_size) == 0);
+    if (!ok) {
+      PLOG(ERROR) << "Unable to grow slot file " << chosen;
+    }
+  } else {
+    ok = true;
+  }
+  int loop_fd = -1;
+  if (ok && backing_now != chosen) {
+    // Switch the loop to the chosen file, preserving old content for
+    // delta payloads that reference it.
+    LOG(INFO) << "Repointing " << loop_node << " from "
+              << (backing_now.empty() ? "<none>" : backing_now) << " to "
+              << chosen;
+    int src_fd = ::open(target_path.c_str(), O_RDONLY | O_CLOEXEC);
+    if (src_fd >= 0) {
+      std::vector<char> buf(1024 * 1024);
+      uint64_t copied = 0;
+      while (ok && copied < loop_bytes) {
+        uint64_t want = loop_bytes - copied;
+        if (want > buf.size()) {
+          want = buf.size();
+        }
+        ssize_t got = 0;
+        size_t off = 0;
+        while (off < want) {
+          got = read(src_fd, buf.data() + off, want - off);
+          if (got == 0) {
+            break;
+          }
+          if (got < 0) {
+            if (errno == EINTR) {
+              continue;
+            }
+            break;
+          }
+          off += got;
+        }
+        if (off != want) {
+          PLOG(ERROR) << "Unable to read old slot content";
+          ok = false;
+          break;
+        }
+        off = 0;
+        while (off < want) {
+          got = write(file_fd, buf.data() + off, want - off);
+          if (got < 0) {
+            if (errno == EINTR) {
+              continue;
+            }
+            break;
+          }
+          off += got;
+        }
+        if (off != want) {
+          PLOG(ERROR) << "Unable to stage old slot content";
+          ok = false;
+          break;
+        }
+        copied += want;
+      }
+      ::close(src_fd);
+    } else {
+      PLOG(ERROR) << "Unable to open " << target_path << " for content copy";
+      ok = false;
+    }
+  }
+  if (ok) {
+    ::fsync(file_fd);
+    loop_fd = ::open(loop_node.c_str(), O_RDWR | O_CLOEXEC);
+    if (loop_fd < 0) {
+      PLOG(ERROR) << "Unable to open loop device " << loop_node;
+      ok = false;
+    }
+  }
+  if (ok && backing_now != chosen) {
+    if (::ioctl(loop_fd, LOOP_CLR_FD, 0) != 0) {
+      PLOG(ERROR) << "LOOP_CLR_FD failed on " << loop_node;
+      ok = false;
+    }
+  }
+  if (ok) {
+    if (backing_now != chosen) {
+      if (::ioctl(loop_fd, LOOP_SET_FD, file_fd) != 0) {
+        PLOG(ERROR) << "LOOP_SET_FD failed on " << loop_node
+                    << ", slot left detached!";
+        ok = false;
+      }
+    } else if (::ioctl(loop_fd, LOOP_SET_CAPACITY, 0) != 0) {
+      PLOG(ERROR) << "LOOP_SET_CAPACITY failed on " << loop_node;
+      ok = false;
+    }
+  }
+  if (loop_fd >= 0) {
+    ::close(loop_fd);
+  }
+  ::close(file_fd);
+  if (!ok) {
+    return false;
+  }
+  uint64_t grown = 0;
+  int vfd = ::open(target_path.c_str(), O_RDONLY | O_CLOEXEC);
+  if (vfd >= 0) {
+    if (::ioctl(vfd, BLKGETSIZE64, &grown) != 0) {
+      grown = 0;
+    }
+    ::close(vfd);
+  }
+  if (grown < required_size) {
+    LOG(ERROR) << "Slot " << target_path << " still too small after fixup";
+    return false;
+  }
+  LOG(INFO) << "Slot " << target_path << " ready, " << grown << " bytes";
+  return true;
+}
 
 // Discard the tail of the block device referenced by |fd|, from the offset
 // |data_size| until the end of the block device. Returns whether the data was
@@ -155,6 +434,18 @@ bool PartitionWriter::Init(const InstallPlan* install_plan,
   // partial updates. Use the source size as the indicator.
 
   target_path_ = install_part_.target_path;
+
+  // Grow/repoint file-backed slot images (kernel_X loop files on live
+  // installs) when the payload needs more room. Must run before any open
+  // or write: repointing detaches the loop.
+  if (!EnsureFileBackedSlotCapacity(target_path_, install_part_.target_size)) {
+    LOG(ERROR) << "Unable to grow target \"" << target_path_
+               << "\" to fit " << install_part_.target_size
+               << " bytes of payload for partition \""
+               << partition.partition_name() << "\"";
+    return false;
+  }
+
   int err{};
 
   int flags = O_RDWR;
@@ -174,8 +465,8 @@ bool PartitionWriter::Init(const InstallPlan* install_plan,
   }
 
   LOG(INFO) << "Applying " << partition.operations().size()
-            << " operations to partition \"" << partition.partition_name()
-            << "\"";
+             << " operations to partition \"" << partition.partition_name()
+             << "\"";
 
   // Discard the end of the partition, but ignore failures.
   DiscardPartitionTail(target_fd_, install_part_.target_size);
