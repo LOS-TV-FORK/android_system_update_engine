@@ -181,16 +181,29 @@ bool EnsureFileBackedSlotCapacity(const std::string& target_path,
     }
   }
   if (ok) {
-    if (::ioctl(loop_fd, LOOP_CLR_FD, 0) != 0) {
-      PLOG(ERROR) << "LOOP_CLR_FD failed on " << loop_node;
-      ok = false;
-    }
-  }
-  if (ok) {
-    if (::ioctl(loop_fd, LOOP_SET_FD, file_fd) != 0) {
-      PLOG(ERROR) << "LOOP_SET_FD failed on " << loop_node
-                  << ", slot left detached!";
-      ok = false;
+    // Refresh the loop size in place. No detach/attach dance: the slot is
+    // never missing and there is no race with concurrent openers.
+    ::fsync(file_fd);
+    if (::ioctl(loop_fd, LOOP_SET_CAPACITY, 0) != 0) {
+      if (errno != ENXIO) {
+        PLOG(ERROR) << "LOOP_SET_CAPACITY failed on " << loop_node;
+        ok = false;
+      } else {
+        // Loop was never attached (or left detached): plain attach, no
+        // CLR needed for an unbound loop.
+        LOG(INFO) << loop_node << " unbound, attaching to " << chosen;
+        for (int attempt = 0; attempt < 50; ++attempt) {
+          if (::ioctl(loop_fd, LOOP_SET_FD, file_fd) == 0) {
+            break;
+          }
+          if (errno != EBUSY || attempt == 49) {
+            PLOG(ERROR) << "LOOP_SET_FD failed on " << loop_node;
+            ok = false;
+            break;
+          }
+          ::usleep(100 * 1000);
+        }
+      }
     }
   }
   if (loop_fd >= 0) {
